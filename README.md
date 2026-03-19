@@ -7,7 +7,7 @@ description: 프로젝트 구조, 기술 스택, 서버 역할, 데이터 흐름
 
 > **프로젝트명**: CMM Server  
 > **한 줄 요약**: 여러 명이 동시에 접속해 게임을 즐길 수 있도록 지원하는 멀티플레이어 게임 서버 시스템  
-> **영상**: [CBT트레일러](https://youtu.be/4HJIC_365GU?si=unZdBOggZm8_7oyq)
+> **영상**: [CBT트레일러](https://youtu.be/4HJIC_365GU?si=unZdBOggZm8_7oyq), [플레이영상1](https://youtu.be/iQbhfPMsVP8?si=v2mMTOKRN2i8ciP9), [플레이영상2](https://youtu.be/p37VRfk0C34?si=nNbjnj7v5uOP53vG)
 
 ---
 
