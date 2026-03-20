@@ -137,135 +137,148 @@ cmm_server/
 
 ---
 
-## 1. Redis 읽기 전용 / 쓰기 전용 연결 분리
+## 1. Redis Reader/Writer Split Connection Pool
+**파일**: `SBLibrary/SBDatabaseLib/Redis/SBRedisConnectionMultiplexerPool.cs`
 
-**어떤 문제를 해결했나**
-데이터를 읽는 요청과 저장하는 요청이 같은 연결을 함께 쓰면, 저장 요청이 많아질 때 읽기 요청도 덩달아 느려지는 병목 현상이 생깁니다.
+- Reader 풀 / Writer 풀 분리 운영 (읽기·쓰기 트래픽 완전 격리)
+- `ConnectionSelectionStrategy.LeastLoaded`로 연결 부하 자동 분산
+- 오류 3회 누적 시 `ReconnectAsync()` 자동 재연결
+- `Stopwatch`로 연결 획득 지연 시간 측정 (성능 진단)
 
-**어떻게 해결했나**
-Redis 연결을 읽기 전용 풀과 쓰기 전용 풀로 완전히 분리했습니다. 두 풀 모두 부하가 가장 적은 연결로 요청을 자동 분배(LeastLoaded 전략)하며, 연결 오류가 3회 누적되면 자동으로 재연결합니다.
-
-**왜 중요한가**
-읽기와 쓰기가 서로 방해하지 않아 동시에 수천 명이 접속해도 빠른 응답 속도를 유지할 수 있습니다.
-
----
-
-## 2. 여러 패킷을 묶어서 한 번에 전송
-
-**어떤 문제를 해결했나**
-게임 중에는 아주 짧은 시간 안에 수십~수백 개의 작은 데이터 조각(패킷)이 발생합니다. 이것을 하나씩 따로 보내면 운영체제에 요청을 반복해야 해서 속도가 떨어집니다.
-
-**어떻게 해결했나**
-각 스레드(처리 흐름)가 전용 버퍼를 따로 갖고, 패킷들을 최대 1MB 크기로 모은 다음 단 한 번에 전송합니다. 수신 버퍼는 고정 배열을 재사용하고, ArraySegment 슬라이싱으로 불필요한 메모리 할당을 최소화하는 방식을 적용했습니다.
-
-**왜 중요한가**
-운영체제 전송 요청 횟수가 대폭 줄어들고, 스레드끼리 버퍼를 공유하지 않아 충돌도 없습니다.
+**Why important**: 읽기/쓰기 분리로 쓰기 경합 제거. LeastLoaded 전략으로 연결 간 부하를 자동 균등 분배.
 
 ---
 
-## 3. 두 개의 작업 목록을 번갈아 사용하는 대기열
+## 2. 패킷 배치 전송 (Batch Send)
+**파일**: `SBLibrary/SBSocketPacketLib/SBTcpSendBuffer.cs`, `SBLibrary/SBSocketServerLib/Session/SBTcpSession.cs`
 
-**어떤 문제를 해결했나**
-새 작업을 추가하는 쪽과 작업을 꺼내 처리하는 쪽이 같은 목록에 동시에 접근하면 서로 기다려야 하는 상황이 생깁니다.
+- `ThreadLocal<SBTcpSendBuffer>`: 스레드별 독립 버퍼 → 락 경합 완전 제거
+- 최대 1MB 청크 (16 × 65536 bytes), 여러 패킷을 하나의 청크에 누적 후 단일 `SendAsync` 호출
+- `Buffer.BlockCopy`로 패킷들을 청크에 병합 후 단 1회 syscall
+- 수신 버퍼(`SBTcpRecvBuffer`)는 `ArraySegment` 슬라이싱으로 복사 없이 데이터 구간 노출
 
-**어떻게 해결했나**
-작업 목록을 두 개 만들어 번갈아 사용합니다. 한쪽에 작업을 넣는 동안 반대쪽 목록의 작업을 처리하고, 처리가 끝나면 역할을 바꿉니다. 목록 교체는 잠금 장치 없이 원자적으로 처리합니다.
-
-**왜 중요한가**
-서로 기다리는 시간이 없어 매칭 서버 등 바쁜 구간에서도 빠르게 메시지를 처리합니다.
-
----
-
-## 4. 무거운 작업은 여럿이, 상태 변경은 혼자서
-
-**어떤 문제를 해결했나**
-게임 상태(점수, 위치 등)를 여러 처리 흐름이 동시에 바꾸면 데이터가 꼬일 수 있습니다. 하지만 하나씩 처리하면 CPU 여러 개를 낭비하게 됩니다.
-
-**어떻게 해결했나**
-작업을 두 단계로 나눴습니다.
-- **1단계**: 여러 백그라운드 스레드가 CPU 집약 작업(패킷 해석 등)을 동시에 처리
-- **2단계**: 메인 스레드 하나만 게임 상태를 변경
-
-**왜 중요한가**
-CPU 성능을 최대한 활용하면서도 데이터 일관성을 안전하게 보장합니다. 게임 서버에서 가장 이상적인 동시 처리 구조입니다.
+**Why important**: 패킷 개수만큼 발생하던 syscall 횟수를 대폭 감소시킴. 스레드별 독립 버퍼로 락 없는 확장성 확보.
 
 ---
 
-## 5. 실행 시간 기준으로 정렬된 작업 예약 시스템
+## 3. Double-Buffered Lock-Free Task Queue
+**파일**: `SBLibrary/SBCommonLib/Thread/SBThreadTaskQueue.cs`
 
-**어떤 문제를 해결했나**
-스킬 쿨타임, 세션 만료, 매칭 제한 시간 등 수천 개의 예약된 작업을 정확한 순서대로 실행해야 합니다.
+- 큐 2개를 번갈아 사용 (`ConcurrentQueue<T>[2]`)
+- `SBAtomicInt.CompareExchange()`로 현재 활성 큐 인덱스를 Atomic하게 교체 (0↔1)
+- 생산자(Producer): 한쪽 큐에 무락(lock-free) 추가
+- 소비자(Consumer): `GetQueue()`로 반대쪽 큐 전체를 한 번에 획득
+- 블로킹 없음, 스피닝 없음 — Wait-Free에 가까운 설계
 
-**어떻게 해결했나**
-실행 시각을 기준으로 정렬되는 우선순위 목록(최소 힙)을 직접 구현했습니다. 가장 빨리 실행해야 할 작업을 O(log N)의 시간 복잡도로 꺼낼 수 있고, 아직 실행 시각이 안 된 작업은 즉시 건너뜁니다.
-
-**왜 중요한가**
-작업 수가 늘어나도 처리 속도가 안정적으로 유지되며, 게임 타이밍 이벤트가 정확한 순서로 동작합니다.
-
----
-
-## 6. 필요할 때만 정리하는 수신 버퍼
-
-**어떤 문제를 해결했나**
-서버가 데이터를 받을 때마다 메모리를 새로 할당하면 메모리 쓰레기 수집(GC)이 자주 발생해 성능이 저하됩니다.
-
-**어떻게 해결했나**
-고정 크기 버퍼에 읽은 위치와 쓴 위치를 별도로 관리합니다. 데이터를 읽을 때는 복사하지 않고 "시작~끝" 위치만 알려줍니다. 버퍼가 꽉 찰 때만 한 번에 정리합니다.
-
-**왜 중요한가**
-접속한 모든 세션에 공통 적용되므로, 접속자 수가 많을수록 절약 효과가 커집니다.
+**Why important**: 서버 핵심 메시지 큐(RankMatchThread 등)에서 사용. 경합 없이 고속 메시지 처리.
 
 ---
 
-## 7. 잠금 없이 상태를 바꾸는 원자적 제어
+## 4. Two-Phase Background Task Processing
+**파일**: `SBLibrary/SBSocketServerLib/Thread/SBBackgroundManager.cs`
 
-**어떤 문제를 해결했나**
-여러 스레드가 동시에 같은 값을 바꾸려 할 때 잠금(lock)을 걸면, 기다리는 스레드가 쌓여 성능이 저하됩니다.
+- **Phase 1** (백그라운드 스레드들): 패킷 파싱 등 CPU 집약 작업을 N개 스레드에서 병렬 처리
+- **Phase 2** (메인 스레드): `ProcessTaskAfter()`로 게임 상태 변경 — 단일 스레드 보장
+- Per-thread 요청 큐 → 완료 큐로 이동하는 2단계 파이프라인
+- Phase 1은 무락, Phase 2는 직렬 → 경합 없이 상태 일관성 유지
 
-**어떻게 해결했나**
-CPU 명령어 수준에서 지원하는 비교-교체(Compare-And-Swap) 연산을 활용했습니다. "현재 값이 0이면 1로 바꿔라"를 잠금 없이 원자적으로 처리합니다.
-
-**왜 중요한가**
-모든 패킷이 통과하는 핵심 경로에서 잠금을 제거해 병목을 방지합니다.
-
----
-
-## 8. 실력 등급별 매칭 + 파티 분리 방지
-
-**어떤 문제를 해결했나**
-실력 차이가 큰 유저가 같은 게임에 배정되거나, 함께 게임 찾기를 한 파티원이 다른 방으로 분리되는 문제가 있을 수 있습니다.
-
-**어떻게 해결했나**
-등급별로 독립적인 방 목록을 관리합니다. 듀오 파티는 두 명을 반드시 같은 방에 함께 배정합니다. 매칭 스레드가 사이클마다 대기 중인 유저들을 일괄 배정합니다.
-
-**왜 중요한가**
-공정한 게임 환경을 보장하고, 파티 플레이 경험이 깨지지 않습니다.
+**Why important**: 멀티코어를 최대한 활용하면서도 게임 상태 변경은 직렬화하는 게임 서버의 이상적인 동시성 모델.
 
 ---
 
-## 9. 중앙 우편함 역할의 메시지 라우터 (Bridge 서버)
+## 5. Binary Heap 기반 Priority Queue Job Timer
+**파일**: `SBLibrary/SBSocketServerLib/Job/JobTimer.cs`
 
-**어떤 문제를 해결했나**
-6개 서버가 서로 직접 연결되면 연결 수가 기하급수적으로 늘어나고, 서버 주소가 바뀔 때마다 여러 곳의 코드를 수정해야 합니다.
+- `IComparable<T>` 구현으로 ExecTick 기준 Min-Heap 유지
+- `Push` O(log N), `Pop` O(log N), `Peek` O(1)
+- `Environment.TickCount` 기반 현재 시각과 비교, 미래 잡은 즉시 break
+- Singleton으로 전역 관리, 여러 서버 모듈에서 주기 태스크에 활용
 
-**어떻게 해결했나**
-Bridge 서버를 중앙 허브로 두고 모든 서버간 메시지를 여기서 중계합니다. 각 서버는 Bridge 주소만 알면 다른 서버와 통신할 수 있습니다.
-
-**왜 중요한가**
-서버를 추가하거나 주소가 바뀌어도 Bridge 한 곳만 수정하면 됩니다. 서버 간 결합도가 낮아져 유지보수가 편합니다.
+**Why important**: 수천 개의 예약 잡을 효율적으로 정렬/실행. 게임 서버 특성상 타이밍이 결정론적이어야 하는데 최적 구조 제공.
 
 ---
 
-## 10. 전 구간 AES-256 패킷 암호화
+## 6. Sliding Window Receive Buffer
+**파일**: `SBLibrary/SBSocketPacketLib/SBTcpRecvBuffer.cs`
 
-**어떤 문제를 해결했나**
-데이터를 암호화하지 않으면 네트워크를 가로채 게임 패킷을 분석하거나 변조하는 치트 도구를 만들 수 있습니다.
+- `_readPos` / `_writePos` 두 포인터로 가용 데이터 영역 추적
+- `ReadSegment`: ArraySegment 슬라이싱으로 복사 없이 읽기 구간 노출
+- `Clean()`: 버퍼가 꽉 찰 때만 `Array.Copy`로 한 번에 compact — Lazy Cleanup
+- 가용 공간(`FreeSize`) / 데이터 크기(`DataSize`) 속성으로 명확한 상태 관리
 
-**어떻게 해결했나**
-클라이언트와 서버 사이의 모든 데이터를 AES-256 방식으로 암호화합니다. ECB 방식(블록이 반복되면 패턴이 보임)은 피하고 CBC 방식을 선택했습니다. 암호화 키는 환경(개발/테스트/운영)별로 분리 관리합니다.
+**Why important**: TCP 스트림 수신에서 불필요한 메모리 할당을 최소화. 모든 세션에 공통 적용되므로 세션 수에 비례해 효과가 누적됨.
 
-**왜 중요한가**
-패킷을 가로채도 내용을 알 수 없고 변조도 불가능해집니다. 환경별 키 분리로 운영 키가 개발 과정에서 노출되는 위험도 차단합니다.
+---
+
+## 7. Lock-Free AtomicInt (CAS)
+**파일**: `SBLibrary/SBCommonLib/Util/SBAtomicInt.cs`
+
+- `Interlocked.CompareExchange`로 mutex 없이 원자적 상태 전환
+- `CasOn()`: 0 → 1 성공 여부 반환 (락 없는 단발 점유)
+- `CompareExchange()`: 0↔1 토글 (Double-Buffered Queue의 인덱스 교체에 사용)
+- JobQueue의 flush 플래그 제어에도 활용 → 락 범위 최소화
+
+**Why important**: 핫패스(모든 패킷 처리 경로)에서 mutex 대신 CAS 사용. CPU 캐시 라인 경합 없이 동시성 제어.
+
+---
+
+## 8. 매칭메이킹 - Rank Grade 기반 룸 할당
+**파일**: `cmm_match/MatchThread/RankMatchThread.cs`
+
+- `ConcurrentDictionary`로 무락 유저 관리 (_users, _duoUsers, _matchRoomUsers)
+- `RankMatchRoomManager.GetUsableMatchRoom(rankGrade)`: 티어별 룸 풀 관리
+- 듀오 파티 별도 처리: 파티원 전체를 같은 룸에 원자적으로 배치
+- 매칭 스레드가 사이클마다 대기 유저를 일괄 배정
+
+**Why important**: 락 없는 자료구조 + 등급별 분리 매칭 = 확장 가능한 매칭 시스템. 파티 정합성 보장.
+
+---
+
+## 9. Hub-and-Spoke 패킷 라우터 (Bridge Server)
+**파일**: `cmm_bridge/PacketHandler.cs`
+
+- 모든 서버(Lobby, Match, Game, Rank)를 Bridge를 통해 통신
+- switch 기반 PacketId 라우팅 → 컴파일 타임 타입 안전성
+- 단일 진입점에서 fanout broadcast, 1:1 relay, 1:N 배포 모두 처리
+- 서버간 직접 연결 없이 Bridge 경유 → 토폴로지 단순화
+
+**Why important**: 서버 추가 시 Bridge만 수정하면 됨. 각 서버는 상대 서버의 IP/포트를 몰라도 됨 → 느슨한 결합(Loose Coupling).
+
+---
+
+## 10. AES-256-CBC 패킷 암호화
+**파일**: `SBLibrary/SBCommonLib/Crypt/SBCrypt.cs`
+
+- AES-256 (Rijndael, 32바이트 키 / 16바이트 IV)
+- CBC 모드 + PKCS7 패딩 — ECB 모드(블록 패턴 노출) 의도적 배제
+- `CryptoStream` 활용으로 스트리밍 암호화 (메모리 효율적)
+- 설정 파일에서 키/IV 주입 → 환경별 키 교체 가능
+
+**Why important**: 게임 패킷 전 구간 암호화로 패킷 스니핑/조작 방어. CBC + PKCS7 조합은 패딩 오라클 공격 방지.
+
+---
+
+## 보너스 — Lazy<T> Singleton + volatile stop flag
+
+**SBSingleton.cs**: `Lazy<T>` 기반 스레드 안전 싱글턴 — 초기화 이후 완전 무락(lock-free) 접근
+**SBThread.cs**: `volatile bool _shouldStop` — CPU 레지스터 캐싱 방지, 정확한 스레드 종료 신호
+
+---
+
+## 패턴 요약표
+
+| 순위 | 패턴 | 파일 | 핵심 이점 |
+|------|------|------|----------|
+| 1 | Redis R/W Split Pool | SBRedisConnectionMultiplexerPool.cs | 읽기/쓰기 격리, LeastLoaded 자동 분배 |
+| 2 | 패킷 배치 전송 | SBTcpSendBuffer + SBTcpSession | Syscall 횟수 대폭 감소 |
+| 3 | Double-Buffered Queue | SBThreadTaskQueue.cs | Wait-Free 큐 교체 |
+| 4 | Two-Phase BG Processing | SBBackgroundManager.cs | 병렬+직렬 혼합 최적 모델 |
+| 5 | Binary Heap Job Timer | JobTimer.cs | O(log N) 스케줄링 |
+| 6 | Sliding Window RecvBuffer | SBTcpRecvBuffer.cs | Lazy Cleanup, 복사 최소화 |
+| 7 | CAS AtomicInt | SBAtomicInt.cs | 락 없는 원자적 제어 |
+| 8 | Rank-Based Matching | RankMatchThread.cs | 티어별 분리, 파티 정합 |
+| 9 | Hub-and-Spoke Router | cmm_bridge/PacketHandler.cs | 느슨한 결합, 단순 토폴로지 |
+| 10 | AES-256-CBC | SBCrypt.cs | 프로덕션 수준 암호화 |
 
 ---
 
